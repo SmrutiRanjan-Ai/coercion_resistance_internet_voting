@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -15,7 +17,6 @@ import (
 	"net/http"
 	"sync"
 	"time"
-	"zkp"
 )
 
 func main() {
@@ -91,14 +92,16 @@ func newElectionAuthority(g_0 *generator, bb *bulletinBoard, publicKey *rsa.Publ
 }
 
 type electionAuthority struct {
-	g_0           *generator
-	registered    map[string]*voter
-	votes         map[string]*encryptedVote
-	nonceCounter  int64
-	salt          []byte
-	bulletinBoard *bulletinBoard
-	passCommList  []passCommit
-	publicKey     *rsa.PublicKey
+	g_0              *generator
+	registered       map[string]*voter
+	votes            map[string]*encryptedVote
+	nonceCounter     int64
+	salt             []byte
+	bulletinBoard    *bulletinBoard
+	passCommList     []passCommit
+	publicKey        *rsa.PublicKey
+	ElectionQuestion []byte
+	mutex            sync.Mutex
 }
 
 type passCommit struct {
@@ -123,8 +126,9 @@ type voter struct {
 type encryptedVote struct {
 	PK       []byte
 	Sigma    []byte
-	ProofPPK *zkp.ChaumPedersenProof
+	Proof    *proof
 	Status   string
+	ProofPPK *ProofPPK
 }
 
 func (ea *electionAuthority) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -184,65 +188,59 @@ func (ea *electionAuthority) handleRegister(w http.ResponseWriter, r *http.Reque
 }
 
 func (ea *electionAuthority) handleVote(w http.ResponseWriter, r *http.Request) {
-	// Parse request body
-	var req struct {
-		VoterID   string
-		Vote      string
-		ProofPPK  *zkp.Proof
-		EncPubKey []byte
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Decode the encrypted vote
+	var encryptedVote encryptedVote
+	err := json.NewDecoder(r.Body).Decode(&encryptedVote)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Lookup voter and validate proof of plaintext knowledge of pk
-	voter, ok := ea.registered[req.VoterID]
+	// Verify the proof of knowledge of the public key
+	pk := new(rsa.PublicKey)
+	err = pk.Unmarshal(encryptedVote.PK)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if encryptedVote.ProofPPK == nil {
+		http.Error(w, "Missing proof of knowledge of public key", http.StatusBadRequest)
+		return
+	}
+	ok, err := ea.VerifyProofPPK(pk, encryptedVote.ProofPPK)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	if !ok {
-		http.Error(w, "voter not registered", http.StatusBadRequest)
-		return
-	}
-	if !zkp.VerifyChaumPedersen(req.ProofPPK, ea.g_0.p, voter.PublicKey, new(big.Int).SetBytes(req.EncPubKey)) {
-		http.Error(w, "invalid proof of plaintext knowledge of public key", http.StatusBadRequest)
+		http.Error(w, "Invalid proof of knowledge of public key", http.StatusBadRequest)
 		return
 	}
 
-	// Encrypt vote
-	var encryptedVote *encryptedVote
-	switch req.Vote {
-	case "yes":
-		encryptedVote = &encryptedVote{
-			PK:     voter.PublicKey,
-			Sigma:  nil,
-			Proof:  req.ProofPPK,
-			Status: "yes",
-		}
-		if err := encryptedVote.Encrypt(ea.g_0, voter.PassCommitYes); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		voter.EncryptedVoteYes = encryptedVote
-	case "no":
-		encryptedVote = &encryptedVote{
-			PK:     voter.PublicKey,
-			Sigma:  nil,
-			Proof:  req.ProofPPK,
-			Status: "no",
-		}
-		if err := encryptedVote.Encrypt(ea.g_0, voter.PassCommitNo); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		voter.EncryptedVoteNo = encryptedVote
-	default:
-		http.Error(w, "invalid vote value", http.StatusBadRequest)
+	// Verify the signature on the encrypted vote
+	ok, err = ea.VerifySignature(encryptedVote.PK, encryptedVote.Sigma, encryptedVote.Status)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		http.Error(w, "Invalid signature on encrypted vote", http.StatusBadRequest)
 		return
 	}
 
-	// Add encrypted vote to the map
-	ea.votes[req.VoterID] = encryptedVote
+	// Decrypt the vote
+	vote, err := ea.Decrypt(pk, encryptedVote.Sigma)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-	// Send response
+	// Store the vote
+	ea.Lock()
+	defer ea.Unlock()
+	ea.votes = append(ea.votes, vote)
+
+	// Send a confirmation response
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -509,4 +507,184 @@ func encryptWithPublicKey(pubKey *rsa.PublicKey, message []byte) ([]byte, error)
 		return nil, err
 	}
 	return encrypted, nil
+}
+
+type proof struct {
+	a *big.Int
+	b *big.Int
+}
+
+// GenerateProof generates a proof of plaintext knowledge for the given public key and its corresponding plaintext.
+// Returns an error if the proof generation fails.
+func (ea *electionAuthority) GenerateProof(pubKey *rsa.PublicKey, plaintext *big.Int) (*proof, error) {
+	// Generate two random numbers r and s
+	r, err := rand.Int(rand.Reader, pubKey.N)
+	if err != nil {
+		return nil, err
+	}
+	s, err := rand.Int(rand.Reader, pubKey.N)
+	if err != nil {
+		return nil, err
+	}
+
+	// Compute the challenge value c = H(pubKey || plaintext || r || s)
+	h := sha256.New()
+	h.Write(pubKey.N.Bytes())
+	h.Write(plaintext.Bytes())
+	h.Write(r.Bytes())
+	h.Write(s.Bytes())
+	c := new(big.Int).SetBytes(h.Sum(nil))
+
+	// Compute the responses a = r - cx and b = s - cx
+	a := new(big.Int).Sub(r, new(big.Int).Mul(c, plaintext))
+	b := new(big.Int).Sub(s, new(big.Int).Mul(c, plaintext))
+
+	// Return the proof
+	return &proof{a, b}, nil
+}
+
+// VerifyProof verifies the given proof of plaintext knowledge for the given public key and its corresponding plaintext.
+// Returns an error if the verification fails.
+
+func VerifyProof(pubKey *rsa.PublicKey, plaintext *big.Int, p *proof) error {
+	// Compute the challenge value c = H(pubKey || plaintext || p.a || p.b)
+	h := sha256.New()
+	h.Write(pubKey.N.Bytes())
+	h.Write(plaintext.Bytes())
+	h.Write(p.a.Bytes())
+	h.Write(p.b.Bytes())
+	c := new(big.Int).SetBytes(h.Sum(nil))
+
+	// Compute the values x1 = g^a * y^c and x2 = h^b * g^c
+	g := big.NewInt(2)
+	y := new(big.Int).Exp(new(big.Int).SetInt64(int64(pubKey.E)), p.a, pubKey.N)
+	h1 := sha256.Sum256([]byte("g"))
+	h2 := sha256.Sum256([]byte("h"))
+	hBytes := sha256.Sum256(append(h1[:], h2[:]...))
+	hInt := new(big.Int).SetBytes(hBytes[:])
+	x1 := new(big.Int).Exp(g, p.a, pubKey.N)
+	x1.Mul(x1, new(big.Int).Exp(y, c, pubKey.N))
+	x2 := new(big.Int).Exp(hInt, p.b, pubKey.N)
+	x2.Mul(x2, new(big.Int).Exp(g, c, pubKey.N))
+
+	// Compute the final challenge value c' = H(pubKey || plaintext || x1 || x2)
+	h.Reset()
+	h.Write(pubKey.N.Bytes())
+	h.Write(plaintext.Bytes())
+	h.Write(x1.Bytes())
+	h.Write(x2.Bytes())
+	cPrime := new(big.Int).SetBytes(h.Sum(nil))
+
+	// Check if the computed challenge value matches the original challenge value
+	if cPrime.Cmp(c) != 0 {
+		return errors.New("proof verification failed")
+	}
+
+	return nil
+}
+
+type ProofPPK struct {
+	Z  []byte
+	T1 []byte
+	T2 []byte
+	T3 []byte
+	E  []byte
+	S  []byte
+}
+
+func (ea *electionAuthority) GenerateProofPPK(pk *rsa.PublicKey) (*ProofPPK, error) {
+	// Generate a random value r
+	r, err := rand.Int(rand.Reader, pk.N)
+	if err != nil {
+		return nil, err
+	}
+
+	// Compute the proof components
+	n := pk.N
+	g := big.NewInt(2)
+	pkInt := new(big.Int).SetBytes(ea.PublicKeyBytes())
+	z := new(big.Int).Mod(r, n)
+	t1 := new(big.Int).Exp(pkInt, r, n)
+	t2 := new(big.Int).Exp(g, z, n)
+	t3 := new(big.Int).Mod(new(big.Int).Mul(t1, t2), n)
+	hash := sha256.Sum256([]byte(t3.String()))
+	e := new(big.Int).SetBytes(hash[:])
+	s := new(big.Int).Mod(new(big.Int).Sub(r, new(big.Int).Mul(e, pkInt)), n)
+
+	// Return the proof
+	proof := &ProofPPK{
+		Z:  z.Bytes(),
+		T1: t1.Bytes(),
+		T2: t2.Bytes(),
+		T3: t3.Bytes(),
+		E:  e.Bytes(),
+		S:  s.Bytes(),
+	}
+	return proof, nil
+}
+
+func (ea *electionAuthority) VerifyProofPPK(pk *rsa.PublicKey, proof *ProofPPK) (bool, error) {
+	// Decompose the public key into its components
+	n := pk.N
+	g := big.NewInt(2)
+	h := new(big.Int).Exp(g, new(big.Int).SetBytes(proof.Z), n)
+	t1 := new(big.Int).SetBytes(proof.T1)
+	t2 := new(big.Int).Exp(g, new(big.Int).SetBytes(proof.Z), n)
+	t3 := new(big.Int).SetBytes(proof.T3)
+	h.Mul(h, t1)
+	h.Mod(h, n)
+	h.Mul(h, t2)
+	h.Mod(h, n)
+
+	// Compute e = H(t3)
+	hash := sha256.Sum256(proof.T3)
+	e := new(big.Int).SetBytes(hash[:])
+
+	// Compute s = r - e * pk
+	r1 := new(big.Int).SetBytes(proof.S)
+	pkInt := new(big.Int).SetBytes(ea.PublicKeyBytes())
+	s := new(big.Int).Mod(new(big.Int).Sub(r1, new(big.Int).Mul(e, pkInt)), n)
+
+	// Verify the proof
+	return h.Cmp(t3) == 0 && s.Cmp(r1) == 0, nil
+}
+
+func (ea *electionAuthority) PublicKeyBytes() []byte {
+	return ea.publicKey.N.Bytes()
+}
+
+func (ea *electionAuthority) VerifySignature(encryptedVote *encryptedVote) (bool, error) {
+	// Get the public key
+	pubKey, err := ea.BytesToPublicKey(encryptedVote.PK)
+	if err != nil {
+		return false, err
+	}
+
+	// Verify the signature
+	hashedVote := sha256.Sum256(encryptedVote.Sigma)
+	err = rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, hashedVote[:], encryptedVote.Sigma)
+	if err != nil {
+		return false, err
+	}
+
+	// Verify the proof of partial knowledge of the private key
+	ok, err := ea.VerifyProofPPK(pubKey, encryptedVote.ProofPPK)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, errors.New("invalid proof of partial knowledge of the private key")
+	}
+
+	// Everything is valid
+	return true, nil
+}
+
+func (ea *electionAuthority) BytesToPublicKey(pkBytes []byte) (*rsa.PublicKey, error) {
+	var pubKey rsa.PublicKey
+	err := json.Unmarshal(pkBytes, &pubKey)
+	if err != nil {
+		return nil, err
+	}
+	return &pubKey, nil
 }
